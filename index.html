@@ -1,14 +1,13 @@
-p<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="id">
 <head>
-<link rel="manifest" href="/manifest.json">
+<link rel="manifest" href="manifest.json">
 <meta name="theme-color" content="#7c3aed">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="SentriX">
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-<meta name="mobile-web-app-capable" content="yes" />
 <meta name="theme-color" content="#0f0f0f" />
 <title>MineControl</title>
 <link rel="preconnect" href="https://fonts.googleapis.com" />
@@ -34,6 +33,897 @@ p<!DOCTYPE html>
   }
   .dot-connected { animation: pulseDot 2s infinite; }
   button { touch-action: manipulation; }
+  @media (prefers-reduced-motion: reduce) {
+    .dot-connected { animation: none; }
+  }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+
+/* ============ Constants ============ */
+const DEFAULT_WS_URL = "ws://localhost:3001";
+const MC_VERSIONS = ["1.8.9","1.12.2","1.16.5","1.18.2","1.19.4","1.20.1","1.20.4"];
+const STORAGE_KEYS = { SERVERS: "mc_servers", USERNAMES: "mc_usernames", WSURL: "mc_ws_url" };
+const BATTERY_INSTRUCTIONS = "Untuk background tetap jalan walaupun layar mati:\n1. Buka Pengaturan HP\n2. Cari Baterai \u2192 Optimasi Baterai\n3. Cari Chrome/Browser \u2192 Jangan Optimalkan\n4. Aktifkan juga di Pengaturan \u2192 Aplikasi \u2192 Chrome \u2192 Baterai";
+
+/* ============ Small helpers ============ */
+function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
+
+function loadLS(key, fallback) {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : fallback;
+  } catch (e) { return fallback; }
+}
+function saveLS(key, value) {
+  try { localStorage.setItem(key, JSON.stringify(value)); } catch (e) { /* ignore */ }
+}
+
+function range(a, b) { const arr = []; for (let i = a; i < b; i++) arr.push(i); return arr; }
+
+function formatTime(ts) {
+  try {
+    const d = new Date(ts);
+    if (isNaN(d.getTime())) return "";
+    return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  } catch (e) { return ""; }
+}
+
+/* ============ Item / block color rules ============ */
+const ITEM_COLOR_RULES = [
+  [["amethyst_shard", "amethyst"], "#7c3aed"],
+  [["grass", "cactus", "leaves", "sapling"], "#16a34a"],
+  [["sword", "axe", "bow", "arrow"], "#dc2626"],
+  [["diamond"], "#22d3ee"],
+  [["gold", "nether_star", "candle"], "#eab308"],
+  [["iron", "stone", "cobblestone"], "#6b7280"],
+  [["chest", "barrel", "shulker"], "#92400e"],
+  [["spawner"], "#1d4ed8"],
+  [["totem"], "#f97316"],
+];
+function getItemColor(name) {
+  if (!name) return "#4b5563";
+  const n = name.toLowerCase();
+  for (const rule of ITEM_COLOR_RULES) {
+    const keys = rule[0], color = rule[1];
+    if (keys.some(k => n.includes(k))) return color;
+  }
+  return "#4b5563";
+}
+function shortName(displayName, name) {
+  const src = (displayName || name || "").replace(/[^a-zA-Z]/g, "");
+  return src.slice(0, 4).toUpperCase() || "?";
+}
+function durabilityColor(ratio) {
+  if (ratio > 0.5) return "#22c55e";
+  if (ratio > 0.2) return "#eab308";
+  return "#ef4444";
+}
+function getBlockColor(name) {
+  if (!name) return "#161616";
+  const n = name.toLowerCase();
+  if (n === "air") return "#161616";
+  if (n.includes("water")) return "#1d4ed8";
+  if (n.includes("lava")) return "#f97316";
+  if (n.includes("grass") || n.includes("leaves") || n.includes("sapling") || n.includes("crop") || n.includes("cactus")) return "#16a34a";
+  if (n.includes("log") || n.includes("wood") || n.includes("planks")) return "#92400e";
+  if (n.includes("sand")) return "#eab308";
+  if (n.includes("stone") || n.includes("cobble") || n.includes("gravel") || n.includes("ore")) return "#6b7280";
+  if (n.includes("snow") || n.includes("ice")) return "#e5e7eb";
+  return "#3a3a3a";
+}
+
+const { useState, useEffect, useRef, useCallback, useMemo, Fragment } = React;
+
+/* ============ WebSocket hook (auto-reconnect every 3s) ============ */
+function useWebSocket(url, onMessage) {
+  const [connected, setConnected] = useState(false);
+  const wsRef = useRef(null);
+  const timerRef = useRef(null);
+  const onMessageRef = useRef(onMessage);
+  onMessageRef.current = onMessage;
+  const connectRef = useRef(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    function scheduleReconnect() {
+      if (timerRef.current) return;
+      timerRef.current = setTimeout(() => {
+        timerRef.current = null;
+        if (!cancelled) connectRef.current();
+      }, 3000);
+    }
+
+    function connect() {
+      let ws;
+      try {
+        ws = new WebSocket(url);
+      } catch (e) {
+        scheduleReconnect();
+        return;
+      }
+      wsRef.current = ws;
+      ws.onopen = () => { if (!cancelled) setConnected(true); };
+      ws.onclose = () => { if (!cancelled) { setConnected(false); scheduleReconnect(); } };
+      ws.onerror = () => { try { ws.close(); } catch (e) { /* ignore */ } };
+      ws.onmessage = (evt) => {
+        try {
+          const data = JSON.parse(evt.data);
+          if (onMessageRef.current) onMessageRef.current(data);
+        } catch (e) { /* ignore malformed frame */ }
+      };
+    }
+
+    connectRef.current = connect;
+    connect();
+
+    return () => {
+      cancelled = true;
+      if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null; }
+      if (wsRef.current) {
+        try { wsRef.current.onclose = null; wsRef.current.close(); } catch (e) { /* ignore */ }
+      }
+    };
+  }, [url]);
+
+  const send = useCallback((obj) => {
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(obj));
+      return true;
+    }
+    return false;
+  }, []);
+
+  return { connected, send };
+}
+
+/* ============ Shared bits ============ */
+function EmptyHint({ text }) {
+  return <div className="text-xs text-[#5c5c66] italic px-1 py-2">{text}</div>;
+}
+
+function TopBar({ connected, onSettings, showBack, onBack, title }) {
+  return (
+    <div className="shrink-0 bg-[#0f0f0f] border-b border-[#232323] px-4 pt-[max(env(safe-area-inset-top),12px)] pb-3 flex items-center justify-between">
+      <div className="flex items-center gap-2 min-w-0">
+        {showBack ? (
+          <button onClick={onBack} aria-label="Back" className="w-8 h-8 -ml-1 flex items-center justify-center rounded-lg text-[#a1a1aa] active:bg-[#1a1a1a] text-lg shrink-0">←</button>
+        ) : (
+          <div className="w-2 h-2 rounded-full bg-[#7c3aed] shrink-0"></div>
+        )}
+        <span className="font-semibold tracking-tight text-[15px] truncate">{title}</span>
+      </div>
+      <div className="flex items-center gap-3 shrink-0">
+        <div className="flex items-center gap-1.5">
+          <span className={"w-2 h-2 rounded-full " + (connected ? "bg-[#22c55e] dot-connected" : "bg-[#ef4444]")}></span>
+          <span className="text-[11px] font-mono-tech text-[#a1a1aa]">{connected ? "Online" : "Offline"}</span>
+        </div>
+        {!showBack && (
+          <button onClick={onSettings} aria-label="Settings" className="w-8 h-8 flex items-center justify-center rounded-lg text-[#a1a1aa] active:bg-[#1a1a1a] text-lg">⚙</button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ============ Home Page ============ */
+function HomePage({ servers, setServers, usernames, setUsernames, onStart }) {
+  const [serverName, setServerName] = useState("");
+  const [serverAddr, setServerAddr] = useState("");
+  const [usernameInput, setUsernameInput] = useState("");
+  const [playModalServer, setPlayModalServer] = useState(null);
+
+  function addServer(e) {
+    e.preventDefault();
+    const name = serverName.trim();
+    const addr = serverAddr.trim();
+    if (!name || !addr) return;
+    let ip = addr, port = "25565";
+    const idx = addr.lastIndexOf(":");
+    if (idx > -1) { ip = addr.slice(0, idx); port = addr.slice(idx + 1); }
+    setServers(prev => [...prev, { id: uid(), name, ip, port }]);
+    setServerName(""); setServerAddr("");
+  }
+  function removeServer(id) { setServers(prev => prev.filter(s => s.id !== id)); }
+
+  function addUsername(e) {
+    e.preventDefault();
+    const name = usernameInput.trim();
+    if (!name) return;
+    setUsernames(prev => [...prev, { id: uid(), name }]);
+    setUsernameInput("");
+  }
+  function removeUsername(id) { setUsernames(prev => prev.filter(u => u.id !== id)); }
+
+  return (
+    <div className="px-4 pt-4 flex flex-col gap-6 pb-8">
+      <section>
+        <h2 className="text-xs font-semibold tracking-widest text-[#7c3aed] uppercase mb-2">Servers</h2>
+        <form onSubmit={addServer} className="bg-[#1a1a1a] rounded-xl p-3 flex flex-col gap-2 border border-[#232323]">
+          <input value={serverName} onChange={e => setServerName(e.target.value)} placeholder="Server name" className="bg-[#0f0f0f] border border-[#2a2a2a] rounded-lg px-3 py-2 text-sm outline-none focus:border-[#7c3aed]" />
+          <input value={serverAddr} onChange={e => setServerAddr(e.target.value)} placeholder="IP:Port (e.g. play.example.net:25565)" className="bg-[#0f0f0f] border border-[#2a2a2a] rounded-lg px-3 py-2 text-sm font-mono-tech outline-none focus:border-[#7c3aed]" />
+          <button type="submit" className="bg-[#7c3aed] active:bg-[#6d28d9] rounded-lg py-2 text-sm font-semibold">+ Add Server</button>
+        </form>
+        <div className="flex flex-col gap-2 mt-3">
+          {servers.length === 0 && <EmptyHint text="No servers saved yet." />}
+          {servers.map(s => (
+            <div key={s.id} className="bg-[#1a1a1a] border border-[#232323] rounded-xl px-3 py-2.5 flex items-center justify-between gap-2">
+              <div className="min-w-0">
+                <div className="text-sm font-medium truncate">{s.name}</div>
+                <div className="text-[11px] font-mono-tech text-[#8b8b95] truncate">{s.ip}:{s.port}</div>
+              </div>
+              <div className="flex items-center gap-1.5 shrink-0">
+                <button onClick={() => setPlayModalServer(s)} aria-label={"Play " + s.name} className="w-9 h-9 rounded-lg bg-[#7c3aed] active:bg-[#6d28d9] flex items-center justify-center text-sm">▶</button>
+                <button onClick={() => removeServer(s.id)} aria-label={"Remove " + s.name} className="w-9 h-9 rounded-lg text-[#71717a] active:bg-[#232323] flex items-center justify-center text-sm">✕</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <section>
+        <h2 className="text-xs font-semibold tracking-widest text-[#7c3aed] uppercase mb-2">Usernames</h2>
+        <form onSubmit={addUsername} className="bg-[#1a1a1a] rounded-xl p-3 flex gap-2 border border-[#232323]">
+          <input value={usernameInput} onChange={e => setUsernameInput(e.target.value)} placeholder="Bot username" className="flex-1 min-w-0 bg-[#0f0f0f] border border-[#2a2a2a] rounded-lg px-3 py-2 text-sm outline-none focus:border-[#7c3aed]" />
+          <button type="submit" className="bg-[#7c3aed] active:bg-[#6d28d9] rounded-lg px-4 text-sm font-semibold shrink-0">Add</button>
+        </form>
+        <div className="flex flex-wrap gap-2 mt-3">
+          {usernames.length === 0 && <EmptyHint text="No usernames saved yet." />}
+          {usernames.map(u => (
+            <div key={u.id} className="bg-[#1a1a1a] border border-[#232323] rounded-full pl-3 pr-1.5 py-1 flex items-center gap-2">
+              <span className="text-sm">{u.name}</span>
+              <button onClick={() => removeUsername(u.id)} aria-label={"Remove " + u.name} className="w-5 h-5 rounded-full text-[#71717a] active:bg-[#232323] flex items-center justify-center text-xs">✕</button>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      {playModalServer && (
+        <PlayModal
+          server={playModalServer}
+          usernames={usernames}
+          onClose={() => setPlayModalServer(null)}
+          onStart={(selUsernames, version) => { setPlayModalServer(null); onStart(playModalServer, selUsernames, version); }}
+        />
+      )}
+    </div>
+  );
+}
+
+function PlayModal({ server, usernames, onClose, onStart }) {
+  const [selected, setSelected] = useState([]);
+  const [version, setVersion] = useState(MC_VERSIONS[MC_VERSIONS.length - 1]);
+
+  function toggle(name) {
+    setSelected(prev => prev.includes(name) ? prev.filter(n => n !== name) : [...prev, name]);
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/60" onClick={onClose}>
+      <div className="w-full max-w-[430px] bg-[#161616] rounded-t-2xl border-t border-[#2a2a2a] p-4 pb-[max(env(safe-area-inset-bottom),16px)]" onClick={e => e.stopPropagation()}>
+        <div className="w-10 h-1 bg-[#333] rounded-full mx-auto mb-4"></div>
+        <div className="text-sm text-[#a1a1aa] mb-1">Connect to</div>
+        <div className="text-lg font-semibold mb-4">{server.name}</div>
+
+        <div className="text-xs font-semibold tracking-widest text-[#7c3aed] uppercase mb-2">Usernames</div>
+        <div className="flex flex-col gap-1.5 mb-4 max-h-[160px] overflow-y-auto">
+          {usernames.length === 0 && <EmptyHint text="Add a username on the home page first." />}
+          {usernames.map(u => (
+            <label key={u.id} className="flex items-center gap-2.5 bg-[#1a1a1a] border border-[#232323] rounded-lg px-3 py-2 active:bg-[#202020]">
+              <input type="checkbox" checked={selected.includes(u.name)} onChange={() => toggle(u.name)} className="w-4 h-4 accent-[#7c3aed]" />
+              <span className="text-sm">{u.name}</span>
+            </label>
+          ))}
+        </div>
+
+        <div className="text-xs font-semibold tracking-widest text-[#7c3aed] uppercase mb-2">Version</div>
+        <select value={version} onChange={e => setVersion(e.target.value)} className="w-full bg-[#1a1a1a] border border-[#232323] rounded-lg px-3 py-2.5 text-sm mb-5 outline-none focus:border-[#7c3aed]">
+          {MC_VERSIONS.map(v => <option key={v} value={v}>{v}</option>)}
+        </select>
+
+        <div className="flex gap-2">
+          <button onClick={onClose} className="flex-1 bg-[#1a1a1a] border border-[#2a2a2a] rounded-lg py-3 text-sm font-semibold active:bg-[#232323]">Cancel</button>
+          <button
+            onClick={() => selected.length > 0 && onStart(selected, version)}
+            disabled={selected.length === 0}
+            className={"flex-1 rounded-lg py-3 text-sm font-bold " + (selected.length > 0 ? "bg-[#7c3aed] active:bg-[#6d28d9]" : "bg-[#2a2a2a] text-[#5c5c66]")}
+          >START</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============ Control Page ============ */
+function ControlPage({ activeBots, selectedBot, onSelectBot, chatMessages, ownUsernames, send, mapData, position, inventory, container }) {
+  const [tab, setTab] = useState("chats");
+
+  return (
+    <div className="h-full flex flex-col min-h-0">
+      <div className="px-4 pt-3 pb-2 shrink-0">
+        <select
+          value={selectedBot || ""}
+          onChange={e => onSelectBot(e.target.value)}
+          className="w-full bg-[#1a1a1a] border border-[#232323] rounded-lg px-3 py-2.5 text-sm font-mono-tech outline-none focus:border-[#7c3aed] disabled:opacity-50"
+          disabled={activeBots.length === 0}
+        >
+          {activeBots.length === 0 && <option value="">No active bots</option>}
+          {activeBots.map(b => <option key={b} value={b}>{b}</option>)}
+        </select>
+      </div>
+
+      <div className="flex-1 min-h-0 px-4">
+        {tab === "chats" && <ChatsTab messages={chatMessages} ownUsernames={ownUsernames} send={send} selectedBot={selectedBot} />}
+        {tab === "movement" && <MovementTab mapData={mapData} position={position} send={send} selectedBot={selectedBot} />}
+        {tab === "inventory" && <InventoryTab inventory={inventory} container={container} send={send} selectedBot={selectedBot} />}
+      </div>
+
+      <BottomNav tab={tab} setTab={setTab} />
+    </div>
+  );
+}
+
+function BottomNav({ tab, setTab }) {
+  const items = [
+    { key: "chats", label: "Chats", icon: "💬" },
+    { key: "movement", label: "Movement", icon: "🧭" },
+    { key: "inventory", label: "Inventory", icon: "🎒" },
+  ];
+  return (
+    <div className="shrink-0 border-t border-[#232323] bg-[#0f0f0f] flex px-2 pt-1.5 pb-[max(env(safe-area-inset-bottom),8px)]">
+      {items.map(it => (
+        <button key={it.key} onClick={() => setTab(it.key)} className={"flex-1 flex flex-col items-center gap-0.5 py-1.5 rounded-lg " + (tab === it.key ? "text-[#a78bfa]" : "text-[#71717a]")}>
+          <span className="text-lg leading-none">{it.icon}</span>
+          <span className="text-[10px] font-medium">{it.label}</span>
+          <span className={"h-0.5 w-5 rounded-full mt-0.5 " + (tab === it.key ? "bg-[#7c3aed]" : "bg-transparent")}></span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/* ============ Chats Tab ============ */
+function ChatsTab({ messages, ownUsernames, send, selectedBot }) {
+  const [text, setText] = useState("");
+  const [history, setHistory] = useState([]);
+  const [histIndex, setHistIndex] = useState(-1);
+  const listRef = useRef(null);
+
+  useEffect(() => {
+    const el = listRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [messages]);
+
+  function sendChat() {
+    const t = text.trim();
+    if (!t) return;
+    send({ type: "chat", text: t, username: selectedBot });
+    setHistory(prev => [...prev, t]);
+    setHistIndex(-1);
+    setText("");
+  }
+  function sendTab() { send({ type: "key", key: "tab", username: selectedBot }); }
+
+  function navHistory(dir) {
+    if (history.length === 0) return;
+    let idx = histIndex;
+    if (dir === "up") {
+      idx = idx === -1 ? history.length - 1 : Math.max(0, idx - 1);
+    } else {
+      if (idx === -1) return;
+      idx = idx + 1;
+      if (idx >= history.length) { setHistIndex(-1); setText(""); return; }
+    }
+    setHistIndex(idx);
+    setText(history[idx]);
+  }
+
+  function colorFor(msg) {
+    if (!msg.username || msg.username === "system") return "text-[#8b8b95]";
+    if (ownUsernames.includes(msg.username)) return "text-[#7dd3fc]";
+    return "text-[#e5e5e5]";
+  }
+
+  return (
+    <div className="h-full flex flex-col">
+      <div ref={listRef} className="flex-1 min-h-0 overflow-y-auto flex flex-col gap-1.5 py-2 pr-0.5">
+        {messages.length === 0 && <EmptyHint text="No chat messages yet." />}
+        {messages.map(m => (
+          <div key={m.id} className="text-[13px] leading-snug break-words">
+            <span className="text-[10px] text-[#5c5c66] font-mono-tech mr-1.5">{formatTime(m.timestamp)}</span>
+            {m.username && <span className={"font-semibold mr-1 " + colorFor(m)}>{m.username}:</span>}
+            <span className={colorFor(m)}>{m.message}</span>
+          </div>
+        ))}
+      </div>
+      <div className="py-2 flex flex-col gap-1.5 border-t border-[#232323] shrink-0">
+        <div className="flex gap-1.5">
+          <input
+            value={text}
+            onChange={e => { setText(e.target.value); setHistIndex(-1); }}
+            onKeyDown={e => { if (e.key === "Enter") sendChat(); }}
+            placeholder="Message..."
+            className="flex-1 min-w-0 bg-[#1a1a1a] border border-[#232323] rounded-lg px-3 py-2 text-sm outline-none focus:border-[#7c3aed]"
+          />
+          <button onClick={sendChat} className="bg-[#7c3aed] active:bg-[#6d28d9] rounded-lg px-4 text-sm font-semibold shrink-0">ENTER</button>
+        </div>
+        <div className="flex gap-1.5">
+          <button onClick={sendTab} className="flex-1 bg-[#1a1a1a] border border-[#232323] rounded-lg py-1.5 text-xs font-semibold active:bg-[#232323]">TAB</button>
+          <button onClick={() => navHistory("up")} className="flex-1 bg-[#1a1a1a] border border-[#232323] rounded-lg py-1.5 text-xs font-semibold active:bg-[#232323]">▲</button>
+          <button onClick={() => navHistory("down")} className="flex-1 bg-[#1a1a1a] border border-[#232323] rounded-lg py-1.5 text-xs font-semibold active:bg-[#232323]">▼</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============ Movement Tab ============ */
+const MAP_SIZE = 21;
+const MAP_CENTER = 10;
+
+function HoldButton({ label, action, send, selectedBot, className }) {
+  const activeRef = useRef(false);
+  function start(e) {
+    e.preventDefault();
+    if (activeRef.current) return;
+    activeRef.current = true;
+    send({ type: "control", action: "start", key: action, username: selectedBot });
+  }
+  function stop(e) {
+    if (e) e.preventDefault();
+    if (!activeRef.current) return;
+    activeRef.current = false;
+    send({ type: "control", action: "stop", key: action, username: selectedBot });
+  }
+  useEffect(() => () => { if (activeRef.current) { activeRef.current = false; send({ type: "control", action: "stop", key: action, username: selectedBot }); } }, [action, selectedBot, send]);
+  return (
+    <button
+      onPointerDown={start}
+      onPointerUp={stop}
+      onPointerLeave={stop}
+      onPointerCancel={stop}
+      onContextMenu={e => e.preventDefault()}
+      className={className}
+      style={{ touchAction: "none" }}
+    >{label}</button>
+  );
+}
+
+function DPad({ send, selectedBot }) {
+  const [sneak, setSneak] = useState(false);
+  function toggleSneak() {
+    const next = !sneak;
+    setSneak(next);
+    send({ type: "control", action: next ? "start" : "stop", key: "sneak", username: selectedBot });
+  }
+  const btnBase = "bg-[#1a1a1a] border border-[#2a2a2a] active:bg-[#7c3aed]/30 active:border-[#7c3aed] rounded-xl flex items-center justify-center text-xl font-bold";
+  return (
+    <div className="flex flex-col items-center gap-3">
+      <div className="grid gap-1.5" style={{ gridTemplateColumns: "64px 64px 64px", gridTemplateRows: "64px 64px 64px" }}>
+        <div></div>
+        <HoldButton label="▲" action="forward" send={send} selectedBot={selectedBot} className={btnBase} />
+        <div></div>
+        <HoldButton label="◄" action="left" send={send} selectedBot={selectedBot} className={btnBase} />
+        <div></div>
+        <HoldButton label="►" action="right" send={send} selectedBot={selectedBot} className={btnBase} />
+        <div></div>
+        <HoldButton label="▼" action="back" send={send} selectedBot={selectedBot} className={btnBase} />
+        <div></div>
+      </div>
+      <div className="flex gap-2 w-full max-w-[220px]">
+        <button onClick={toggleSneak} className={"flex-1 rounded-xl py-3 text-xs font-bold border " + (sneak ? "bg-[#7c3aed] border-[#7c3aed]" : "bg-[#1a1a1a] border-[#2a2a2a] text-[#a1a1aa]")}>SNEAK</button>
+        <HoldButton label="LOMPAT" action="jump" send={send} selectedBot={selectedBot} className="flex-1 rounded-xl py-3 text-xs font-bold bg-[#1a1a1a] border border-[#2a2a2a] text-[#e5e5e5] active:bg-[#7c3aed]/30 active:border-[#7c3aed]" />
+      </div>
+    </div>
+  );
+}
+
+function MovementTab({ mapData, position, send, selectedBot }) {
+  const grid = useMemo(() => {
+    const cells = new Array(MAP_SIZE * MAP_SIZE).fill(null);
+    if (mapData && Array.isArray(mapData.blocks)) {
+      const bx = mapData.botX, bz = mapData.botZ;
+      for (const b of mapData.blocks) {
+        if (!Array.isArray(b) || b.length < 3) continue;
+        const gx = MAP_CENTER + (b[0] - bx);
+        const gz = MAP_CENTER + (b[1] - bz);
+        if (gx < 0 || gx >= MAP_SIZE || gz < 0 || gz >= MAP_SIZE) continue;
+        cells[gz * MAP_SIZE + gx] = b[2];
+      }
+    }
+    return cells;
+  }, [mapData]);
+
+  const centerIdx = MAP_CENTER * MAP_SIZE + MAP_CENTER;
+
+  return (
+    <div className="h-full overflow-y-auto flex flex-col gap-4 py-3">
+      <div>
+        <div className="aspect-square w-full rounded-xl overflow-hidden border border-[#232323] bg-[#0a0a0a] p-1">
+          <div className="grid w-full h-full" style={{ gridTemplateColumns: "repeat(21, 1fr)", gridTemplateRows: "repeat(21, 1fr)", gap: "1px" }}>
+            {grid.map((name, i) => (
+              <div key={i} className="relative" style={{ background: i === centerIdx ? "#0a0a0a" : getBlockColor(name) }}>
+                {i === centerIdx && (
+                  <div className="absolute inset-0 flex items-center justify-center">
+                    <div className="w-[70%] h-[70%] rounded-full bg-[#ef4444]" style={{ boxShadow: "0 0 6px 2px rgba(239,68,68,0.7)" }}></div>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+        <div className="flex justify-center gap-4 mt-2 font-mono-tech text-xs text-[#a1a1aa]">
+          <span>X <span className="text-[#e5e5e5]">{position ? Math.round(position.x) : "--"}</span></span>
+          <span>Y <span className="text-[#e5e5e5]">{position ? Math.round(position.y) : "--"}</span></span>
+          <span>Z <span className="text-[#e5e5e5]">{position ? Math.round(position.z) : "--"}</span></span>
+        </div>
+      </div>
+      <DPad send={send} selectedBot={selectedBot} />
+    </div>
+  );
+}
+
+/* ============ Inventory Tab ============ */
+function InvSlot({ data, onTap, hotbar, active, label }) {
+  const filled = !!(data && data.count > 0);
+  return (
+    <button
+      onClick={onTap}
+      className={
+        "relative aspect-square rounded-md flex items-center justify-center overflow-hidden " +
+        (active ? "ring-2 ring-[#eab308] " : hotbar ? "ring-1 ring-[#3a3a3a] " : "") +
+        (filled ? "bg-[#3a3a3a]" : "bg-[#2a2a2a]")
+      }
+    >
+      {filled ? (
+        <Fragment>
+          <div className="w-[60%] h-[60%] rounded-sm flex items-center justify-center" style={{ background: getItemColor(data.name) }}>
+            <span className="text-[8px] font-bold text-white leading-none">{shortName(data.displayName, data.name)}</span>
+          </div>
+          {data.count > 1 && (
+            <span className="absolute bottom-0.5 right-1 text-[9px] font-bold text-white" style={{ textShadow: "0 1px 2px rgba(0,0,0,0.9)" }}>{data.count}</span>
+          )}
+          {typeof data.durability === "number" && typeof data.maxDurability === "number" && data.maxDurability > 0 && (
+            <div className="absolute left-0.5 right-0.5 bottom-0.5 h-[3px] rounded-full bg-black/50 overflow-hidden">
+              <div className="h-full" style={{ width: Math.max(0, Math.min(100, (data.durability / data.maxDurability) * 100)) + "%", background: durabilityColor(data.durability / data.maxDurability) }}></div>
+            </div>
+          )}
+        </Fragment>
+      ) : (
+        label ? <span className="text-[7px] text-[#4b5563] font-semibold">{label}</span> : null
+      )}
+    </button>
+  );
+}
+
+function ContainerPanel({ container, onClose, onSlotTap }) {
+  const slotMap = useMemo(() => {
+    const m = {};
+    (container.slots || []).forEach(s => { m[s.slot] = s; });
+    return m;
+  }, [container.slots]);
+  const count = container.slotCount || (container.slots ? container.slots.length : 0);
+
+  return (
+    <div className="bg-[#161616] border border-[#2a2a2a] rounded-xl p-3">
+      <div className="flex items-center justify-between mb-2">
+        <div className="text-sm font-semibold truncate pr-2">{container.title || "Container"}</div>
+        <button onClick={onClose} aria-label="Close container" className="w-7 h-7 shrink-0 rounded-lg bg-[#232323] active:bg-[#2a2a2a] flex items-center justify-center text-xs">✕</button>
+      </div>
+      <div className="grid grid-cols-9 gap-1.5">
+        {range(0, count).map(idx => (
+          <InvSlot key={idx} data={slotMap[idx]} onTap={() => onSlotTap(slotMap[idx], idx)} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function SlotSheet({ slotData, send, selectedBot, onClose }) {
+  const hasItem = slotData && slotData.count > 0;
+  function act(button) {
+    send({ type: "inventory_click", slot: slotData.slot, button: button, username: selectedBot });
+    onClose();
+  }
+  return (
+    <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/60" onClick={onClose}>
+      <div className="w-full max-w-[430px] bg-[#161616] rounded-t-2xl border-t border-[#2a2a2a] p-4 pb-[max(env(safe-area-inset-bottom),16px)]" onClick={e => e.stopPropagation()}>
+        <div className="w-10 h-1 bg-[#333] rounded-full mx-auto mb-4"></div>
+        {hasItem ? (
+          <Fragment>
+            <div className="flex items-center gap-3 mb-3">
+              <div className="w-10 h-10 rounded-md shrink-0" style={{ background: getItemColor(slotData.name) }}></div>
+              <div className="min-w-0">
+                <div className="text-sm font-semibold truncate">{slotData.displayName || slotData.name}</div>
+                <div className="text-xs text-[#8b8b95]">x{slotData.count}</div>
+              </div>
+            </div>
+            {Array.isArray(slotData.lore) && slotData.lore.length > 0 && (
+              <div className="mb-4 flex flex-col gap-0.5">
+                {slotData.lore.map((l, i) => <div key={i} className="text-xs text-[#8b8b95]">{l}</div>)}
+              </div>
+            )}
+            <div className="grid grid-cols-2 gap-2">
+              <button onClick={() => act(0)} className="bg-[#1a1a1a] border border-[#2a2a2a] rounded-lg py-2.5 text-sm font-semibold active:bg-[#232323]">Klik Kiri</button>
+              <button onClick={() => act(1)} className="bg-[#1a1a1a] border border-[#2a2a2a] rounded-lg py-2.5 text-sm font-semibold active:bg-[#232323]">Klik Kanan</button>
+              <button onClick={() => act("drop")} className="bg-[#1a1a1a] border border-[#2a2a2a] rounded-lg py-2.5 text-sm font-semibold active:bg-[#232323] text-[#f87171]">Drop</button>
+              <button onClick={onClose} className="bg-[#7c3aed] active:bg-[#6d28d9] rounded-lg py-2.5 text-sm font-semibold">Tutup</button>
+            </div>
+          </Fragment>
+        ) : (
+          <div className="text-center py-4">
+            <div className="text-sm text-[#5c5c66] mb-4">Slot kosong</div>
+            <button onClick={onClose} className="w-full bg-[#7c3aed] active:bg-[#6d28d9] rounded-lg py-2.5 text-sm font-semibold">Tutup</button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function InventoryTab({ inventory, container, send, selectedBot }) {
+  const [sheetSlot, setSheetSlot] = useState(null);
+
+  const slotMap = useMemo(() => {
+    const m = {};
+    (inventory.slots || []).forEach(s => { m[s.slot] = s; });
+    return m;
+  }, [inventory.slots]);
+
+  function openSheet(slotData, slotIndex) {
+    setSheetSlot(slotData ? Object.assign({}, slotData, { slot: slotIndex }) : { slot: slotIndex, name: null, displayName: null, count: 0 });
+  }
+  function closeContainer() {
+    send({ type: "close_window", username: selectedBot });
+  }
+
+  return (
+    <div className="h-full overflow-y-auto flex flex-col gap-4 py-3">
+      {container && <ContainerPanel container={container} onClose={closeContainer} onSlotTap={openSheet} />}
+
+      <div>
+        <div className="text-xs font-semibold tracking-widest text-[#7c3aed] uppercase mb-2">Inventory</div>
+
+        <div className="grid grid-cols-9 gap-1.5 mb-2">
+          <InvSlot data={slotMap[5]}  onTap={() => openSheet(slotMap[5],  5)}  label="HELM" />
+          <InvSlot data={slotMap[6]}  onTap={() => openSheet(slotMap[6],  6)}  label="CHST" />
+          <InvSlot data={slotMap[7]}  onTap={() => openSheet(slotMap[7],  7)}  label="LEGS" />
+          <InvSlot data={slotMap[8]}  onTap={() => openSheet(slotMap[8],  8)}  label="BOOT" />
+          <div></div>
+          <InvSlot data={slotMap[45]} onTap={() => openSheet(slotMap[45], 45)} label="OFFH" />
+          <div></div><div></div><div></div>
+        </div>
+
+        <div className="grid grid-cols-9 gap-1.5 mb-2">
+          {range(9, 36).map(idx => <InvSlot key={idx} data={slotMap[idx]} onTap={() => openSheet(slotMap[idx], idx)} />)}
+        </div>
+
+        <div className="grid grid-cols-9 gap-1.5">
+          {range(36, 45).map(idx => (
+            <InvSlot key={idx} data={slotMap[idx]} onTap={() => openSheet(slotMap[idx], idx)} hotbar active={inventory.selectedHotbarSlot === idx - 36} />
+          ))}
+        </div>
+      </div>
+
+      {sheetSlot && <SlotSheet slotData={sheetSlot} send={send} selectedBot={selectedBot} onClose={() => setSheetSlot(null)} />}
+    </div>
+  );
+}
+
+/* ============ Settings Page ============ */
+function SettingsPage({ wsUrl, setWsUrl, connected }) {
+  const [urlInput, setUrlInput] = useState(wsUrl);
+  const [wakeLockActive, setWakeLockActive] = useState(false);
+  const wakeLockRef = useRef(null);
+  const [wakeLockError, setWakeLockError] = useState("");
+
+  useEffect(() => { setUrlInput(wsUrl); }, [wsUrl]);
+
+  const requestWakeLock = useCallback(async () => {
+    setWakeLockError("");
+    if (!("wakeLock" in navigator)) {
+      setWakeLockError("Wake Lock API tidak didukung di browser ini.");
+      return;
+    }
+    try {
+      const lock = await navigator.wakeLock.request("screen");
+      wakeLockRef.current = lock;
+      setWakeLockActive(true);
+      lock.addEventListener("release", () => { setWakeLockActive(false); });
+    } catch (err) {
+      setWakeLockError("Gagal mengaktifkan wake lock.");
+      setWakeLockActive(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    function onVisible() {
+      if (document.visibilityState === "visible" && wakeLockActive && !wakeLockRef.current) {
+        requestWakeLock();
+      }
+    }
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
+  }, [wakeLockActive, requestWakeLock]);
+
+  function saveUrl() {
+    const v = urlInput.trim();
+    if (v) setWsUrl(v);
+  }
+  function openBatterySettings() {
+    window.location.href = "intent://settings/battery#Intent;scheme=android-app;end";
+  }
+
+  return (
+    <div className="px-4 pt-4 flex flex-col gap-6 pb-8">
+      <section>
+        <h2 className="text-xs font-semibold tracking-widest text-[#7c3aed] uppercase mb-2">AFK & Background</h2>
+        <div className="bg-[#1a1a1a] border border-[#232323] rounded-xl p-3.5 flex flex-col gap-3">
+          <div className="flex items-center justify-between">
+            <span className="text-sm">Wake Lock</span>
+            <span className={"text-xs font-mono-tech font-semibold " + (wakeLockActive ? "text-[#22c55e]" : "text-[#71717a]")}>
+              {wakeLockActive ? "Active" : "Not Active"}
+            </span>
+          </div>
+          <button onClick={requestWakeLock} className="bg-[#7c3aed] active:bg-[#6d28d9] rounded-lg py-2.5 text-sm font-semibold">Request Wake Lock</button>
+          {wakeLockError && <div className="text-xs text-[#f87171]">{wakeLockError}</div>}
+          <div className="border-t border-[#232323] pt-3 mt-1">
+            <p className="text-xs text-[#a1a1aa] whitespace-pre-line leading-relaxed">{BATTERY_INSTRUCTIONS}</p>
+          </div>
+          <button onClick={openBatterySettings} className="bg-[#1a1a1a] border border-[#2a2a2a] rounded-lg py-2.5 text-sm font-semibold active:bg-[#232323]">Buka Pengaturan Baterai</button>
+        </div>
+      </section>
+
+      <section>
+        <h2 className="text-xs font-semibold tracking-widest text-[#7c3aed] uppercase mb-2">Koneksi</h2>
+        <div className="bg-[#1a1a1a] border border-[#232323] rounded-xl p-3.5 flex flex-col gap-3">
+          <div className="flex items-center gap-2">
+            <span className={"w-2 h-2 rounded-full " + (connected ? "bg-[#22c55e] dot-connected" : "bg-[#ef4444]")}></span>
+            <span className="text-xs font-mono-tech text-[#a1a1aa]">{connected ? "Connected" : "Disconnected"}</span>
+          </div>
+          <input value={urlInput} onChange={e => setUrlInput(e.target.value)} placeholder="ws://localhost:3001" className="bg-[#0f0f0f] border border-[#2a2a2a] rounded-lg px-3 py-2 text-sm font-mono-tech outline-none focus:border-[#7c3aed]" />
+          <button onClick={saveUrl} className="bg-[#7c3aed] active:bg-[#6d28d9] rounded-lg py-2.5 text-sm font-semibold">Save</button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+/* ============ App ============ */
+function App() {
+  const [page, setPage] = useState("home");
+  const [prevPage, setPrevPage] = useState("home");
+  const [servers, setServers] = useState(() => loadLS(STORAGE_KEYS.SERVERS, []));
+  const [usernames, setUsernames] = useState(() => loadLS(STORAGE_KEYS.USERNAMES, []));
+  const [wsUrl, setWsUrl] = useState(() => loadLS(STORAGE_KEYS.WSURL, DEFAULT_WS_URL));
+
+  const [activeBots, setActiveBots] = useState([]);
+  const [selectedBot, setSelectedBot] = useState(null);
+  const [chatMessages, setChatMessages] = useState([]);
+  const [mapData, setMapData] = useState(null);
+  const [position, setPosition] = useState(null);
+  const [inventory, setInventory] = useState({ slots: [], selectedHotbarSlot: 0 });
+  const [container, setContainer] = useState(null);
+
+  const handleMessage = useCallback((data) => {
+    if (!data || typeof data !== "object") return;
+    switch (data.type) {
+      case "chat":
+        setChatMessages(prev => [...prev.slice(-299), { id: uid(), username: data.username, message: data.message, timestamp: data.timestamp || Date.now() }]);
+        break;
+      case "map":
+        setMapData({ blocks: data.blocks || [], botX: data.botX, botZ: data.botZ, botY: data.botY });
+        break;
+      case "position":
+        setPosition({ x: data.x, y: data.y, z: data.z });
+        break;
+      case "inventory":
+        setInventory({ slots: data.slots || [], selectedHotbarSlot: data.selectedHotbarSlot || 0 });
+        break;
+      case "window_open":
+        setContainer({ title: data.title, slotCount: data.slotCount, slots: data.slots || [] });
+        break;
+      case "window_close":
+        setContainer(null);
+        break;
+      case "bots":
+        if (Array.isArray(data.list)) setActiveBots(data.list);
+        break;
+      default:
+        break;
+    }
+  }, []);
+
+  const { connected, send } = useWebSocket(wsUrl, handleMessage);
+
+  useEffect(() => { saveLS(STORAGE_KEYS.SERVERS, servers); }, [servers]);
+  useEffect(() => { saveLS(STORAGE_KEYS.USERNAMES, usernames); }, [usernames]);
+  useEffect(() => { saveLS(STORAGE_KEYS.WSURL, wsUrl); }, [wsUrl]);
+
+  function goSettings() { setPrevPage(page); setPage("settings"); }
+  function closeSettings() { setPage(prevPage); }
+
+  function handleStart(server, selectedUsernames, version) {
+    setActiveBots(selectedUsernames);
+    setSelectedBot(selectedUsernames[0] || null);
+    setChatMessages([]);
+    setMapData(null);
+    setPosition(null);
+    setInventory({ slots: [], selectedHotbarSlot: 0 });
+    setContainer(null);
+    send({ type: "start", server: { name: server.name, ip: server.ip, port: server.port }, usernames: selectedUsernames, version });
+    if (selectedUsernames[0]) send({ type: "select_bot", username: selectedUsernames[0] });
+    setPage("control");
+  }
+
+  function handleSelectBot(username) {
+    setSelectedBot(username);
+    setMapData(null);
+    setPosition(null);
+    setInventory({ slots: [], selectedHotbarSlot: 0 });
+    setContainer(null);
+    send({ type: "select_bot", username });
+  }
+
+  const ownUsernames = useMemo(() => usernames.map(u => u.name), [usernames]);
+
+  return (
+    <div className="app-h w-full flex justify-center bg-[#0f0f0f]">
+      <div className="w-full max-w-[430px] h-full flex flex-col bg-[#0f0f0f] relative overflow-hidden">
+        <TopBar
+          connected={connected}
+          onSettings={goSettings}
+          showBack={page === "settings"}
+          onBack={closeSettings}
+          title={page === "settings" ? "Settings" : page === "control" ? "Control" : "MineControl"}
+        />
+        <div className="flex-1 min-h-0 flex flex-col">
+          {page === "home" && (
+            <div className="h-full overflow-y-auto">
+              <HomePage servers={servers} setServers={setServers} usernames={usernames} setUsernames={setUsernames} onStart={handleStart} />
+            </div>
+          )}
+          {page === "control" && (
+            <ControlPage
+              activeBots={activeBots}
+              selectedBot={selectedBot}
+              onSelectBot={handleSelectBot}
+              chatMessages={chatMessages}
+              ownUsernames={ownUsernames}
+              send={send}
+              mapData={mapData}
+              position={position}
+              inventory={inventory}
+              container={container}
+            />
+          )}
+          {page === "settings" && (
+            <div className="h-full overflow-y-auto">
+              <SettingsPage wsUrl={wsUrl} setWsUrl={setWsUrl} connected={connected} />
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+
+</script>
+
+<!-- FIX BUG 3: Service worker di dalam body sebelum </body>, path relatif tanpa / -->
+<script>
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('sw.js');
+  }
+</script>
+</body>
+</html>
   @media (prefers-reduced-motion: reduce) {
     .dot-connected { animation: none; }
   }
