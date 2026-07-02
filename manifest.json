@@ -1,0 +1,22 @@
+{
+  "name": "Mine Control",
+  "short_name": "MC",
+  "description": "Minecraft Bot Controller",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0f0f0f",
+  "theme_color": "#7c3aed",
+  "orientation": "portrait",
+  "icons": [
+    {
+      "src": "https://raw.githubusercontent.com/microsoft/fluentui-emoji/main/assets/Pickaxe/3D/pickaxe_3d.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "https://raw.githubusercontent.com/microsoft/fluentui-emoji/main/assets/Pickaxe/3D/pickaxe_3d.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}
