@@ -39,6 +39,11 @@
   }
 </style>
 </head>
+<script>
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/sw.js');
+  }
+</script>
 <body>
 <div id="root"></div>
 <script type="text/babel" data-presets="react">
