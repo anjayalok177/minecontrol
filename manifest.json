@@ -1,6 +1,6 @@
 {
   "name": "Mine Control",
-  "short_name": "MC",
+  "short_name": "MineC",
   "description": "Minecraft Bot Controller",
   "start_url": "/",
   "display": "standalone",
